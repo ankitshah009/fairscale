@@ -19,14 +19,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 
 from fairscale.nn.model_parallel import initialize as mpu
-from tests.nn.model_parallel.commons import dist_init, spawn_for_all_world_sizes
+from fairscale.utils.testing import dist_init, spawn_for_all_world_sizes
 
 
-def run_test_initialize_model_parallel(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_initialize_model_parallel(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     if torch.distributed.get_rank() == 0:
         print("> testing initialize_model_parallel with size {} ...".format(model_parallel_size))
@@ -62,8 +63,8 @@ def run_test_initialize_model_parallel(rank, model_parallel_size):
         print(">> passed the test :-)")
 
 
-def run_test_get_model_parallel_src_rank(rank, model_parallel_size_):
-    dist_init(rank, model_parallel_size_)
+def run_test_get_model_parallel_src_rank(rank, model_parallel_size_, filename, filename_rpc):
+    dist_init(rank, model_parallel_size_, filename, filename_rpc)
 
     if torch.distributed.get_rank() == 0:
         print("> testing get_model_parallel_src_rank with size {} ...".format(model_parallel_size_))
@@ -110,7 +111,7 @@ def test_adjacency(monkeypatch):
         def get_world_size(self):
             return data_parallel_size * pipeline_length * model_parallel_size
 
-        def new_group(self, args):
+        def new_group(self, args, backend=None):
             new_groups.append(args.copy())
             return ()
 
@@ -125,10 +126,11 @@ def test_adjacency(monkeypatch):
     for group in new_groups:
         buckets[len(group)].append(group)
 
-    assert sorted(list(buckets.keys())) == [model_parallel_size, data_parallel_size]
+    assert sorted(list(buckets.keys())) == [model_parallel_size, pipeline_length, data_parallel_size]
 
     assert len(buckets[model_parallel_size]) == pipeline_length * data_parallel_size
     assert len(buckets[data_parallel_size]) == model_parallel_size * pipeline_length
+    assert len(buckets[pipeline_length]) == model_parallel_size * data_parallel_size
 
     # Check that model_parallel groups are contiguous
     for group in buckets[model_parallel_size]:

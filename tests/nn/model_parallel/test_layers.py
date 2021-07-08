@@ -19,19 +19,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+
+import pytest
 import torch
-from torch import nn
 import torch.nn.init as init
 from torch.nn.parameter import Parameter
 
 from fairscale.nn.model_parallel import initialize as mpu
 from fairscale.nn.model_parallel import layers
-from fairscale.nn.pipe import Pipe
-from tests.nn.model_parallel.commons import dist_init, get_world_sizes, set_random_seed, spawn_for_all_world_sizes
+from fairscale.utils.testing import dist_init, set_random_seed, spawn_for_all_world_sizes
 
 
-def run_test_parallel_embedding(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_parallel_embedding(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     if torch.distributed.get_rank() == 0:
         print("> testing parallel embedding with model parallel size {} ...".format(model_parallel_size))
@@ -100,8 +101,8 @@ def run_test_parallel_embedding(rank, model_parallel_size):
         print(">> passed the test :-)")
 
 
-def run_test_initialize_affine_weight(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_initialize_affine_weight(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     mpu.initialize_model_parallel(model_parallel_size)
     if torch.distributed.get_rank() == 0:
@@ -176,8 +177,8 @@ class IdentityLayer2D(torch.nn.Module):
         return self.weight
 
 
-def run_test_column_parallel_linear(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_column_parallel_linear(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     mpu.initialize_model_parallel(model_parallel_size)
     if torch.distributed.get_rank() == 0:
@@ -237,8 +238,8 @@ def run_test_column_parallel_linear(rank, model_parallel_size):
         print(" >> passed the test :-)")
 
 
-def run_test_row_parallel_linear(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_row_parallel_linear(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     mpu.initialize_model_parallel(model_parallel_size)
     if torch.distributed.get_rank() == 0:
@@ -297,69 +298,6 @@ def run_test_row_parallel_linear(rank, model_parallel_size):
         print(" >> passed the test :-)")
 
 
-def run_test_pipe(rank, model_parallel_size):
-    pipe_world_size = 2
-    dist_init(rank, model_parallel_size)
-
-    mpu.initialize_model_parallel(model_parallel_size)
-    if torch.distributed.get_rank() == 0:
-        print(
-            "> testing Sequential + Pipe with model parallel size: {}, pipe: {}".format(
-                model_parallel_size, pipe_world_size
-            )
-        )
-    model_parallel_size = mpu.get_model_parallel_world_size()
-    chunk_size = 8
-
-    seed = 12345
-    set_random_seed(seed)
-    input_size_coeff = 13
-    input_size = input_size_coeff * model_parallel_size
-    output_size_coeff = 17
-    output_size = output_size_coeff * model_parallel_size
-    batch_size = 7 * chunk_size
-
-    identity = IdentityLayer2D(batch_size, input_size).cuda()
-
-    pipeline_devices = mpu.get_pipeline_parallel_group()
-    if pipe_world_size == 2 and len(pipeline_devices) == 1:
-        pipeline_devices.append(pipeline_devices[0] + model_parallel_size)
-
-    set_random_seed(seed)
-    model = nn.Sequential(
-        layers.ColumnParallelLinear(input_size, output_size, keep_master_weight_for_test=True, bias=False).cuda(),
-        nn.ReLU(),
-        layers.RowParallelLinear(output_size, input_size, keep_master_weight_for_test=True, bias=False).cuda(),
-    )
-
-    set_random_seed(seed)
-    reference = nn.Sequential(
-        nn.Linear(input_size, output_size, bias=False).cuda(),
-        nn.ReLU(),
-        nn.Linear(output_size, input_size, bias=False).cuda(),
-    )
-
-    reference[0].weight.data = model[0].master_weight.cuda()
-    reference[-1].weight.data = model[-1].master_weight.cuda()
-
-    loss_weight = torch.randn([batch_size, output_size]).cuda()
-    output = model(identity())
-    reference_output = reference(identity())
-
-    error = reference_output.sub(output).max()
-    torch.distributed.barrier()
-    assert error < 1.0e-6
-
-    if pipe_world_size == 2:
-        pipe_model = Pipe(model, [2, 1], devices=pipeline_devices, chunks=chunk_size)
-        torch.distributed.barrier()
-        pipe_output = pipe_model(identity())
-
-        error = reference_output.sub(pipe_output.cuda()).max()
-        torch.distributed.barrier()
-        assert error < 1.0e-6
-
-
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
@@ -376,11 +314,6 @@ def test_column_parallel():
     spawn_for_all_world_sizes(run_test_column_parallel_linear)
 
 
+@pytest.mark.skipif("OMPI_COMM_WORLD_RANK" not in os.environ, reason="only works on mpi")
 def test_row_parallel():
     spawn_for_all_world_sizes(run_test_row_parallel_linear)
-
-
-def test_pipe():
-    world_sizes = [x for x in get_world_sizes() if x <= torch.cuda.device_count() / 2]
-
-    spawn_for_all_world_sizes(run_test_pipe, world_sizes)

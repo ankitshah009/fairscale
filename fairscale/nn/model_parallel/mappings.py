@@ -19,15 +19,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 import torch
 
 from .initialize import get_model_parallel_group
 from .utils import split_tensor_along_last_dim
 
 
-def _reduce(input_: torch.Tensor) -> torch.Tensor:
+def _reduce(ctx: Any, input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the the input tensor across model parallel group."""
     group = get_model_parallel_group()
+
+    if ctx:
+        ctx.mark_dirty(input_)
 
     # Bypass the function if we are using only 1 GPU.
     if torch.distributed.get_world_size(group=group) == 1:
@@ -91,7 +96,7 @@ class _CopyToModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):  # type: ignore
-        return _reduce(grad_output)
+        return _reduce(None, grad_output)
 
 
 class _ReduceFromModelParallelRegion(torch.autograd.Function):
@@ -99,7 +104,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_):  # type: ignore
-        return _reduce(input_)
+        return _reduce(ctx, input_)
 
     @staticmethod
     def backward(ctx, grad_output):  # type: ignore

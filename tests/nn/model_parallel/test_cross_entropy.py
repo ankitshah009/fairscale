@@ -19,13 +19,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import torch
 import torch.nn.functional as F
 
 from fairscale.nn.model_parallel import initialize as mpu
 from fairscale.nn.model_parallel.cross_entropy import vocab_parallel_cross_entropy
 from fairscale.nn.model_parallel.mappings import scatter_to_model_parallel_region
-from tests.nn.model_parallel.commons import IdentityLayer, dist_init, set_random_seed, spawn_for_all_world_sizes
+from fairscale.utils.testing import IdentityLayer, dist_init, set_random_seed, spawn_for_all_world_sizes
 
 
 def torch_cross_entropy(batch_size, seq_length, vocab_size, logits_scale, seed):
@@ -49,8 +50,8 @@ def mpu_cross_entropy(batch_size, seq_length, vocab_size, logits_scale, seed):
     return loss, identity.weight.grad
 
 
-def run_test_cross_entropy(rank, model_parallel_size):
-    dist_init(rank, model_parallel_size)
+def run_test_cross_entropy(rank, model_parallel_size, filename, filename_rpc):
+    dist_init(rank, model_parallel_size, filename, filename_rpc)
 
     if torch.distributed.get_rank() == 0:
         print("> testing cross entropy with model parallel size {} ...".format(model_parallel_size))

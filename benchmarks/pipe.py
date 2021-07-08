@@ -1,198 +1,251 @@
-# Copyright (c) Facebook, Inc. and its affiliates. All rights reserved.
+# Copyright (c) Facebook, Inc. and its affiliates.
+#
+# This source code is licensed under the BSD license found in the
+# LICENSE file in the root directory of this source tree.
 
+import argparse
+from collections import defaultdict
+from functools import reduce
+import gc
+import logging
 import math
+import operator
 import time
 
+from datasets.wikitext2_data import get_real_dataloaders as get_real_wikitext2_dataloaders
+from datasets.wikitext2_data import get_synthetic_dataloaders as get_synthetic_wikitext2_dataloaders
+from models import transformer_lm
+import numpy as np
 import torch
-import torch.nn as nn
-import torchtext
-from torchtext.data.utils import get_tokenizer
+import torch.distributed as dist
+from torch.distributed import rpc
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import Adam
 
+from benchmarks.golden_configs.lm_wikitext2 import Pipe as lm_wikitext2
 from fairscale.nn import Pipe
-from fairscale.optim import GradScaler
+from fairscale.nn.model_parallel import initialize_model_parallel
+from fairscale.utils.testing import dist_init
 
-try:
-    from fairscale.optim import Adam, Precision  # type: ignore
-
-    can_benchmark = True
-except ImportError:
-    from torch.optim import Adam  # type: ignore
-
-    can_benchmark = False
+MPI_PORT = 29500
+RPC_PORT = 29501
 
 
-class EmbeddingLayer(nn.Embedding):
-    def __init__(self, ntoken, ninp, initrange):
-        super().__init__(ntoken, ninp)
-        self.ninp = ninp
-        self.weight.data.uniform_(-initrange, initrange)
+def init_random_seed(seed: int):
 
-    def forward(self, src):
-        return super().forward(src) * math.sqrt(self.ninp)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    np.random.seed(seed)
 
 
-class PositionalEncodingLayer(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super(PositionalEncodingLayer, self).__init__()
-        self.dropout = nn.Dropout(p=dropout)
+def get_model_and_optimizer(args, device, benchmark_config, model_config):
+    """Return instantiated model and optimizer function."""
 
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer("pe", pe)
+    if args.model_name == "lm":
+        model = get_lm_model(args, device, model_config)
 
-    def forward(self, x):
-        x = x + self.pe[: x.size(0), :]
-        return self.dropout(x)
+    lr = benchmark_config["lr"]
+
+    def make_adam(params):
+        return Adam(params, lr=lr)
+
+    optimizer = make_adam
+    return model, optimizer
 
 
-class TransformerDecoderLayer(nn.TransformerEncoderLayer):
-    """Though this class inherits from torch.nn.TransformerEncoderLayer,
-        it functions as a decoder in this model"""
+def get_lm_model(args, device, config):
+    """Get language model(based on GPT-2) used for sequence prediction."""
 
-    def __init__(self, ninp, nhead, nhid, droupout):
-        super().__init__(ninp, nhead, nhid, droupout)
-        self.src_mask = None
+    ninp = config["ninp"]
+    nhead = config["nhead"]
+    initrange = config["initrange"]
+    dropout = config["dropout"]
+    vocab_size = config["vocab_size"]
+    nhid = config["nhid"]
+    ndecoder = config["num_decoder_layers"]
 
-    def _generate_square_subsequent_mask(self, sz):
-        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
-        mask = mask.float().masked_fill(mask == 0, float("-inf")).masked_fill(mask == 1, float(0.0))
-        return mask
+    if args.lazy_construction:
+        layers = [
+            LazyModule(lambda: transformer_lm.EmbeddingLayer(vocab_size, ninp, initrange)),
+            LazyModule(lambda: transformer_lm.PositionalEncodingLayer(ninp, dropout)),
+        ]
+        for _ in range(ndecoder):
+            layers.append(LazyModule(lambda: transformer_lm.TransformerDecoderLayer(ninp, nhead, nhid, dropout)))
 
-    def forward(self, src):
-        if self.src_mask is None or self.src_mask.size(0) != len(src):
-            device = src.device
-            mask = self._generate_square_subsequent_mask(len(src)).to(device)
-            self.src_mask = mask
+        layers.append(LazyModule(lambda: transformer_lm.LinearLayer(ninp, vocab_size, initrange)))
+        model = layers
+    else:
+        model = transformer_lm.TransformerLM(vocab_size, ninp, nhead, nhid, dropout, initrange, ndecoder).to(device)
 
-        return super().forward(src, self.src_mask)
-
-
-class LinearLayer(nn.Linear):
-    def __init__(self, ninp, ntoken, initrange):
-        super().__init__(ninp, ntoken)
-        self.bias.data.zero_()
-        self.weight.data.uniform_(-initrange, initrange)
+    return model
 
 
-class TransformerLMSequntial(nn.Sequential):
-    """A small language model based on the design of GPT-2 using nn.Sequeitnal
-       for compatability with Pipe"""
+def get_tensors_by_size_bucket():
 
-    def __init__(self, ntokens, ninp, nhead, nhid, dropout, initrange):
-        super(TransformerLMSequntial, self).__init__(
-            EmbeddingLayer(ntokens, ninp, initrange),
-            PositionalEncodingLayer(ninp, dropout),
-            TransformerDecoderLayer(ninp, nhead, nhid, dropout),
-            LinearLayer(ninp, ntokens, initrange),
+    size_buckets = defaultdict(int)
+    for obj in gc.get_objects():
+        if not isinstance(obj, torch.Tensor):
+            continue
+        if obj.device.type == "cuda":
+            size_buckets[(*obj.size(),) + (obj.element_size(),)] += 1
+
+    return size_buckets
+
+
+def log_number_of_parameters(model):
+
+    num_params = reduce(operator.add, (reduce(operator.mul, x.size()) for x in model.parameters()))
+    if hasattr(model, "group"):
+        total = torch.Tensor([num_params])
+        if torch.cuda.is_available():
+            total = total.cuda()
+        torch.distributed.all_reduce(total, group=model.group)
+        logging.debug(
+            f"training model, #params = {num_params}, group: {model.group.rank()}, grank:"
+            f" {torch.distributed.get_rank()}, sizes {model.group.size()}"
         )
+        torch.distributed.barrier()
+        if model.group.rank() == 0:
+            logging.debug(f"total #prams = {total.item()}")
+    else:
+        logging.debug(f"training model, #params = {num_params}")
 
 
-def get_data(device):
-    TEXT = torchtext.data.Field(
-        tokenize=get_tokenizer("basic_english"), init_token="<sos>", eos_token="<eos>", lower=True
-    )
-    train_txt, val_txt, test_txt = torchtext.datasets.WikiText2.splits(TEXT)
-    TEXT.build_vocab(train_txt)
-    ntokens = len(TEXT.vocab.stoi)
+def get_device(model, index):
+    if isinstance(model, DDP):
+        model = model.module
 
-    batch_size = 500
-    eval_batch_size = 200
-    train_data = batchify(train_txt, batch_size, TEXT, device)
-    val_data = batchify(val_txt, eval_batch_size, TEXT, device)
-    test_data = batchify(test_txt, eval_batch_size, TEXT, device)
-
-    return ntokens, train_data, val_data, test_data
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    if hasattr(model, "devices"):
+        return model.devices[index]
+    else:
+        return torch.cuda.current_device()
 
 
-def batchify(data, bsz, TEXT, device):
-    data = TEXT.numericalize([data.examples[0].text])
-    nbatch = data.size(0) // bsz
-    data = data.narrow(0, 0, nbatch * bsz)
-    data = data.view(bsz, -1).t().contiguous()
-    return data.to(device)
+def get_fake_dataloader(lm_dataloader_len, args):
+    fake_input = {"input": torch.zeros(args.batch_size)}
+
+    class FakeDataset:
+        def __getitem__(self, index):
+            return fake_input
+
+        def __len__(self):
+            return lm_dataloader_len
+
+    return FakeDataset()
 
 
-def get_batch(source, i, bptt):
-    seq_len = min(bptt, len(source) - 1 - i)
-    data = source[i : i + seq_len]
-    target = source[i + 1 : i + 1 + seq_len].view(-1)
-    return data, target
+def train(model_config, model, benchmark_config, model_specs, args):
+    lm_dataloader, _, _ = model_config["data"]
+    criterion = benchmark_config["criterion"]
+    vocab_size = model_specs["vocab_size"]
+    optimizer = model_config["optimizer"]
 
-
-def make_model(device, ntokens):
-    ninp = 50  # embedding dimension
-    nhid = 50  # the dimension of the feedforward network model in nn.TransformerEncoder
-    nhead = 2  # the number of heads in the multiheadattention models
-    dropout = 0
-    initrange = 0.1
-
-    model = TransformerLMSequntial(ntokens, ninp, nhead, nhid, dropout, initrange).half().to(device)
-    balance = generate_balance(min(num_devices, 4), len(model))
-    p = Pipe(model, balance, chunks=len(balance))
-
-    criterion = nn.CrossEntropyLoss()
-    lr = 0.001  # learning rate
-
-    try:
-        optimizer = Adam(p.parameters(), lr=lr, precision=Precision.PURE_FP16)
-    except NameError:
-        optimizer = Adam(p.parameters(), lr=lr)
-    scaler = GradScaler()
-
-    return p, criterion, optimizer, scaler
-
-
-def train(train_data, model, criterion, optimizer, scaler, bptt, ntokens):
     model.train()
+    log_number_of_parameters(model)
+
     total_loss = 0.0
+    word_counter = 0
+
+    optimizer = optimizer(model.parameters())
+
+    pipe_group = model.group if hasattr(model, "group") else None
+
+    # TODO(anj-s): Avoid sending fake data to all replicas except the first and last one.
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    if pipe_group and pipe_group.rank() != 0 and pipe_group.rank() != (pipe_group.size() - 1):
+        lm_dataloader, _, _ = get_synthetic_dataloaders(args, device, benchmark_config, model_specs)
+
+    total_tokens = 0
+    total_tokens_per_log_interval = 0
+    bptt = 2
     start_time = time.time()
-    for batch, i in enumerate(range(0, train_data.size(0) - 1, bptt)):
-        data, targets = get_batch(train_data, i, bptt)
+    epoch_start_time = 0.0
+
+    def get_batch(source):
+        seq_len = len(source) - 1
+        data = source[0:seq_len]
+        target = source[1 : 1 + seq_len]
+        return data, target
+
+    for i, batch in enumerate(lm_dataloader):
+        if i == 1:
+            epoch_start_time = time.time()
+
+        source, target = get_batch(batch)
+        if args.max_batch and i > args.max_batch:
+            break
+
+        if i > 0:
+            total_tokens += source.numel()
+
         optimizer.zero_grad()
-        output = model(data)
-        output = output.to(targets.device)
+        try:
+            if pipe_group is None or pipe_group.rank() == 0:
+                tmp = source.to(get_device(model, 0))
+                output = model(tmp)
+            else:
+                output = model(source)
+        except Exception as e:
+            raise RuntimeError(f"training failed on {torch.distributed.get_rank()}") from e
 
-        loss = criterion(output.view(-1, ntokens), targets)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)  # scaler.step automatically unscale if unscale has not yet been performed
-        scaler.update()
+        if pipe_group is None or pipe_group.rank() == pipe_group.size() - 1:
+            target = target.to(get_device(model, -1))
+            output = output.to(target.device)
+            loss = criterion(output.view(-1, vocab_size), target.view(-1))
+            loss.backward()
+            del target
+        else:
+            model.back_helper(output)
 
-        total_loss += loss.item()
-        log_interval = 50
-        if batch % log_interval == 0 and batch > 0:
-            cur_loss = total_loss / log_interval
-            elapsed = time.time() - start_time
-            try:
-                print(
-                    "| {:5d}/{:5d} batches | ms/batch {:5.2f} | "
-                    "loss {:5.2f} | ppl {:8.2f} | grad scale {:3d} | optim scale {:3d}".format(
-                        batch,
-                        len(train_data) // bptt,
-                        elapsed * 1000 / log_interval,
-                        cur_loss,
-                        math.exp(cur_loss),
-                        int(scaler.get_scale()),
-                        int(optimizer._optim_scale),
+        del output
+
+        torch.nn.utils.clip_grad_value_(model.parameters(), model_specs["clip_value"])
+        optimizer.step()
+
+        if pipe_group is None or pipe_group.rank() == pipe_group.size() - 1:
+            total_loss += loss.item()
+            log_interval = 1
+            total_tokens_per_log_interval += source.numel()
+            if i % log_interval == 0 and i > 0:
+                cur_loss = total_loss / log_interval
+                elapsed = time.time() - start_time
+                if dist.get_rank() == dist.get_world_size() - 1:
+                    logging.debug(
+                        "| batch {:5d} | wps {:5.2f} | loss {:5.2f} | ppl {:8.2f}".format(
+                            i, total_tokens_per_log_interval / elapsed, cur_loss, math.exp(cur_loss)
+                        )
                     )
-                )
-            except AttributeError:
-                print(
-                    "| {:5d}/{:5d} batches | ms/batch {:5.2f} | "
-                    "loss {:5.2f} | ppl {:8.2f}".format(
-                        batch, len(train_data) // bptt, elapsed * 1000 / log_interval, cur_loss, math.exp(cur_loss)
-                    )
-                )
-            total_loss = 0
-            start_time = time.time()
+                total_tokens_per_log_interval = 0
+                total_loss = 0
+                start_time = time.time()
+
+    if epoch_start_time != 0:
+        wps = total_tokens / (time.time() - epoch_start_time)
+    else:
+        raise RuntimeError(
+            "Unable to benchmark on a single batch. Increase the size " " of the dataset and rerun the benchmark."
+        )
+    if dist.get_rank() == dist.get_world_size() - 1:
+        return wps, loss.item()
+    else:
+        return 0.0, 0.0
 
 
-def evaluate(eval_model, data_source, criterion, bptt, ntokens):
+# TODO(anj-s): Add an option for users to be able to benchmark evaluate.
+def evaluate(eval_model, data_source, criterion, ntokens):
     eval_model.eval()
     total_loss = 0.0
+    # TODO(anj-s): Move this to the benchmark config if we want to benchmark evaluation.
+    bptt = 35
+
+    def get_batch(source, i, bptt):
+        seq_len = min(bptt, len(source) - 1 - i)
+        data = source[i : i + seq_len]
+        target = source[i + 1 : i + 1 + seq_len].view(-1)
+        return data, target
+
     with torch.no_grad():
         for i in range(0, data_source.size(0) - 1, bptt):
             data, targets = get_batch(data_source, i, bptt)
@@ -207,55 +260,64 @@ def get_number_of_words(data):
     return data.size()[0] * data.size()[1]
 
 
-def benchmark_language_model(train_data, val_data, test_data, model, criterion, optimizer, scaler, ntokens):
-    epoch = 1
-    bptt = 35
-    start_time = time.time()
-
-    print("-" * 110)
-    print("| start of epoch {:1d}".format(epoch))
-    print("-" * 110)
-    epoch_start_time = time.time()
-    train(train_data, model, criterion, optimizer, scaler, bptt, ntokens)
-    val_loss = evaluate(model, val_data, criterion, bptt, ntokens)
-    print("-" * 110)
-    print(
-        "| end of epoch {:1d} | time: {:5.2f}s | valid loss {:5.2f} ".format(
-            epoch, (time.time() - epoch_start_time), val_loss
-        )
+def verify_peak_memory(rank, golden_config, std_dev):
+    logging.debug(
+        "Peak allocated bytes on cuda:0: {:1d}".format(torch.cuda.memory_stats(rank)["allocated_bytes.all.peak"])
     )
-    print("-" * 110)
-
-    elapsed_time = time.time() - start_time
-    nwords = get_number_of_words(train_data) + get_number_of_words(val_data)
-    wps = nwords / elapsed_time
-
-    test_loss = evaluate(model, test_data, criterion, bptt, ntokens)
-    print("=" * 110)
-    print(
-        "| end of training | test loss {:5.2f} \n| time: {:5.2f}s | words: {:3d} | wps: {:5.2f}".format(
-            test_loss, elapsed_time, nwords, wps
+    current_device_usage = torch.cuda.memory_stats(rank)["allocated_bytes.all.peak"]
+    golden_ref = golden_config["peak_mem_usage"][rank]
+    if not current_device_usage < golden_ref * std_dev:
+        raise RuntimeError(
+            "Peak memory usage for cuda device {:d} is {:d} which"
+            "is less than golden reference value of {:d}".format(rank, current_device_usage, golden_ref)
         )
-    )
-    print("=" * 110)
 
-    if can_benchmark and len(model.balance) == 4:
+
+def verify_lm_run(wps, golden_config, args):
+    """Verify that words per second for a given benchmark run matches the golden data."""
+
+    if dist.get_rank() == dist.get_world_size() - 1:
         # Assert that words per second is within 3 standard deviations of the average
-        # of six golden runs
-        assert wps > 36954.4 - (3 * 116.825)
+        # of five golden runs
+        logging.info("Throughput(wps) is {:.2f}.".format(wps))
+        if not wps > (golden_config["avg_wps"] - (3 * golden_config["std_dev_wps"])):
+            raise RuntimeError(
+                "Throughput(wps):{:.2f} is below the golden threshold of an "
+                "average value of {:.2f} and standard dev of {:.2f}.".format(
+                    wps, golden_config["avg_wps"], golden_config["std_dev_wps"]
+                )
+            )
 
-        print("Peak allocated bytes on cuda:0: {:1d}".format(torch.cuda.memory_stats(0)["allocated_bytes.all.peak"]))
-        print("Peak allocated bytes on cuda:1: {:1d}".format(torch.cuda.memory_stats(1)["allocated_bytes.all.peak"]))
-        print("Peak allocated bytes on cuda:2: {:1d}".format(torch.cuda.memory_stats(2)["allocated_bytes.all.peak"]))
-        print("Peak allocated bytes on cuda:3: {:1d}".format(torch.cuda.memory_stats(3)["allocated_bytes.all.peak"]))
+    for i in range(4):
+        verify_peak_memory(i, golden_config, 1.1)
 
-        # Assert that memory usage on each GPU is within 10% of golden run
-        # Right-hand-side is golden run bytes * 110%
-        assert torch.cuda.memory_stats(0)["allocated_bytes.all.peak"] < 4061909504 * 1.1
-        assert torch.cuda.memory_stats(1)["allocated_bytes.all.peak"] < 4050944 * 1.1
-        assert torch.cuda.memory_stats(2)["allocated_bytes.all.peak"] < 10427392 * 1.1
-        assert torch.cuda.memory_stats(3)["allocated_bytes.all.peak"] < 2031824896 * 1.1
-        print("No regression detected")
+
+def benchmark_language_model(model_config, model, benchmark_config, model_specs, args):
+    golden_config = get_golden_config(args.model_name, args)
+    epoch = benchmark_config["epochs"]
+    start_time = time.time()
+    if dist.get_rank() == dist.get_world_size() - 1:
+        logging.debug("-" * 110)
+        logging.debug("| start of epoch {:1d}".format(epoch))
+        logging.debug("-" * 110)
+    wps, loss = train(model_config, model, benchmark_config, model_specs, args)
+    elapsed_time = time.time() - start_time
+    if dist.get_rank() == dist.get_world_size() - 1:
+        logging.debug("-" * 110)
+        logging.debug("| end of epoch {:1d} | time: {:5.2f}s | train loss {:5.2f} ".format(epoch, elapsed_time, loss))
+        logging.debug("-" * 110)
+        logging.debug("Throughput(wps) is {:.2f}.".format(wps))
+    logging.debug(
+        "Peak allocated bytes on cuda:{}: {:1d}".format(
+            dist.get_rank(), torch.cuda.memory_stats(dist.get_rank())["allocated_bytes.all.peak"]
+        )
+    )
+
+    if len(model.balance) == 4:
+        if args.model_name == "lm":
+            verify_lm_run(wps, golden_config, args)
+        else:
+            raise RuntimeError("Unrecognized args.model_name " % args.model_name)
 
 
 def generate_balance(num_devices, num_layers):
@@ -272,13 +334,135 @@ def generate_balance(num_devices, num_layers):
     return balance
 
 
-if __name__ == "__main__":
-    num_devices = torch.cuda.device_count()
-    assert num_devices > 0
+def get_synthetic_dataloaders(args, device, benchmark_config, model_specs):
+    """Returns dataloader for synthetic data."""
 
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    ntokens, train_data, val_data, test_data = get_data(device)
-    model, criterion, optimizer, scaler = make_model(device, ntokens)
-    benchmark_language_model(train_data, val_data, test_data, model, criterion, optimizer, scaler, ntokens)
+    if args.model_name == "lm":
+        return get_synthetic_wikitext2_dataloaders(args, benchmark_config, model_specs)
+    else:
+        raise RuntimeError("Unrecognized args.model_mame " % args.model_name)
+
+
+def get_real_dataloaders(args, device, benchmark_config, model_specs):
+    """Returns dataloaders for real data."""
+
+    if args.model_name == "lm":
+        data = get_real_wikitext2_dataloaders(args, benchmark_config, model_specs)
+        ntokens, train_dataloader, valid_dataloader, test_dataloader = data
+        model_specs["vocab_size"] = ntokens
+        return train_dataloader, valid_dataloader, test_dataloader
+    else:
+        raise RuntimeError("Unrecognized args.model_mame " % args.model_name)
+
+
+def create_model_config(args, benchmark_config=None, model_specs=None):
+    """Return a dict with the given model, dataset and optimizer."""
+
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+    if args.use_synthetic_data:
+        dataloader_fn = get_synthetic_dataloaders
+    else:
+        dataloader_fn = get_real_dataloaders
+
+    data = dataloader_fn(args, device, benchmark_config, model_specs)
+    model, optimizer = get_model_and_optimizer(args, device, benchmark_config, model_specs)
+    return {
+        "model": model,
+        "optimizer": optimizer,
+        "data": data,
+    }
+
+
+def create_benchmark_config(model_name):
+    """Return a dict with configurations required for benchmarking `model_name` model."""
+
+    if model_name == "lm":
+        return lm_wikitext2.get_benchmark_config()
+    else:
+        raise RuntimeError("Unrecognized args.model_mame " % args.model_name)
+
+
+def get_model_specs(model_name):
+    """Return a dict with configurations required for configuring `model_name` model."""
+
+    if model_name == "lm":
+        return lm_wikitext2.get_model_config()
+    else:
+        raise RuntimeError("Unrecognized args.model_mame " % args.model_name)
+
+
+def get_golden_config(model_name, args):
+    """Return a dict with the golden data for throughput and memory usage."""
+
+    if model_name == "lm":
+        return lm_wikitext2.get_golden_real_stats()
+    else:
+        raise RuntimeError("Unrecognized args.model_mame " % args.model_name)
+
+
+def benchmark_single_process(args):
+    """Benchmark a given model using a single process and multiple devices."""
+
+    init_method_pgroup = "tcp://localhost:{}".format(MPI_PORT)
+    torch.distributed.init_process_group(backend="gloo", rank=0, world_size=1, init_method=init_method_pgroup)
+
+    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    assert num_devices > 0
+    init_random_seed(0)
+
+    benchmark_config = create_benchmark_config(args.model_name)
+    model_specs = get_model_specs(args.model_name)
+    model_config = create_model_config(args, benchmark_config=benchmark_config, model_specs=model_specs)
+    model = model_config["model"]
+
+    balance = generate_balance(min(num_devices, 4), len(model))
+    pipe_model = Pipe(model, balance, chunks=args.chunks, checkpoint=args.checkpoint)
     del model
+    del model_config["model"]
+
+    if args.dry_run:
+        train(model_config, pipe_model, benchmark_config, model_specs, args)
+    else:
+        benchmark_language_model(model_config, pipe_model, benchmark_config, model_specs, args)
+
+
+def run_worker(rank, world_size, args):
+    if args.world_size != 0:
+        world_size = args.world_size
+    dist_init(rank + args.rank_base, world_size, hostname=args.host)
+    initialize_model_parallel(1, world_size)
+    init_random_seed(0)
+    run_mp_worker(args, world_size)
+
+    rpc.shutdown()
+    torch.distributed.destroy_process_group()
+
+
+parser = argparse.ArgumentParser(description="benchmark")
+parser.add_argument("--host", "-o", type=str, default="localhost", help="hostname")
+parser.add_argument("--chunks", type=int, default=1, help="number of microbatches per batch")
+parser.add_argument("--batch-size", type=int, default=8, help="size of a batch")
+parser.add_argument(
+    "--checkpoint", default="never", choices=["always", "except_last", "never"], help="Checkpointing strategy for pipe"
+)
+parser.add_argument(
+    "--lazy-construction", action="store_true", default=False, help="Number of decoder layers in the model"
+)
+parser.add_argument("--max-batch", type=int, default=4, help="Max number of batches")
+parser.add_argument("--use_synthetic_data", action="store_true", help="Uses synthetic data for running benchmarks.")
+parser.add_argument("--dry_run", action="store_true", help="Run a sample training run without regression testing.")
+parser.add_argument(
+    # TODO(anj-s): In the process of adding more models and hence the requirement for a flag.
+    "--model_name",
+    default="lm",
+    help="Language Model(LM) used to benchmark nn.pipe.",
+)
+parser.add_argument("--debug", action="store_true", default=False, help="Display additional debug information")
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO if not args.debug else logging.DEBUG)
+
+    logging.info(f"Running single process benchmark with args: {args}")
+    benchmark_single_process(args)

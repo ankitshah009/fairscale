@@ -4,12 +4,21 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-:mod:`fairgc.optim` is a package implementing various torch optimization algorithms.
+:mod:`fairscale.optim` is a package implementing various torch optimization algorithms.
 """
+import logging
+from typing import List
+
+from .adascale import AdaScale, AdaScaleWrapper
+from .oss import OSS
 
 try:
     from .adam import Adam, Precision
 except ImportError:  # pragma: no cover
     pass  # pragma: no cover
-from .grad_scaler import GradScaler
-from .oss import OSS
+try:
+    from .grad_scaler import GradScaler
+except ImportError:
+    logging.warning("Torch AMP is not available on this platform")
+
+__all__: List[str] = []

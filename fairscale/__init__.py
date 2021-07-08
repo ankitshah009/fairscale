@@ -3,10 +3,15 @@
 # This source code is licensed under the BSD license found in the
 # LICENSE file in the root directory of this source tree.
 
-__version__ = "0.0.2"
+# Please update the doc version in docs/source/conf.py as well.
+__version__ = "0.3.7"
 
 ################################################################################
 # Import most common subpackages
 ################################################################################
 
+from typing import List
+
 from . import nn
+
+__all__: List[str] = []

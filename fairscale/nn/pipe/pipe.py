@@ -20,11 +20,14 @@
 """The Pipe interface."""
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union, cast
+import warnings
 
 import torch
 from torch import Tensor, nn
 import torch.autograd
 import torch.cuda
+
+from fairscale.utils import torch_version
 
 from . import microbatch
 from .batchnorm import DeferredBatchNorm
@@ -202,7 +205,7 @@ class Pipe(Module):
             ``'except_last'``, or ``'never'`` (default: ``'except_last'``)
         deferred_batch_norm (bool):
             whether to use deferred BatchNorm moving statistics (default:
-            :data:`False`, see :ref:`Deferred Batch Normalization` for more
+            :data:`False`, see :class:`Deferred Batch Normalization <DeferredBatchNorm>` for more
             details)
 
     Raises:
@@ -254,6 +257,14 @@ class Pipe(Module):
         deferred_batch_norm: bool = False,
     ) -> None:
         super().__init__()
+
+        if torch_version()[:2] >= (1, 8):
+            warnings.warn(
+                "fairscale.nn.Pipe has been upstreamed to PyTorch as torch.distributed.pipeline.sync.Pipe. "
+                "It is now deprecated and will be removed in a future version of fairscale. "
+                "The PyTorch API has minor changes. Please see https://pytorch.org/docs/stable/pipeline.html for details.",
+                DeprecationWarning,
+            )
 
         chunks = int(chunks)
         checkpoint = str(checkpoint)
@@ -339,15 +350,13 @@ class Pipe(Module):
         raise MOVING_DENIED
 
     def to(self, *args: Any, **kwargs: Any) -> "Pipe":
-        # Deny these usages:
-        #
-        # - to(device[, dtype, non_blocking])
-        # - to(tensor[, non_blocking])
-        #
-        # But allow this:
-        #
-        # - to(dtype[, non_blocking])
-        #
+        """ Deny these usages:
+         - to(device[, dtype, non_blocking])
+         - to(tensor[, non_blocking])
+
+         But allow this:
+         - to(dtype[, non_blocking])"""
+
         if "device" in kwargs or "tensor" in kwargs:
             raise MOVING_DENIED
 
